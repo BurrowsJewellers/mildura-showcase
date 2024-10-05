@@ -4,13 +4,13 @@ namespace App\Console\Commands\Shopify;
 
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
-use App\Http\Controllers\SyncJobController;
-use Shopify\Rest\Admin2024_01\InventoryLevel;
-use Shopify\Rest\Admin2024_01\Product;
-use App\Models\ShopifyLocation;
-use App\Models\ShopifyProduct;
-use App\Models\ShopifyProductVariant;
+use Shopify\Rest\Admin2024_07\InventoryLevel;
+use Shopify\Rest\Admin2024_07\Product;
 use App\Services\ShopifyService;
+use App\Services\SyncJobService;
+use App\Models\Shopify\ShopifyLocation;
+use App\Models\Shopify\ShopifyProduct;
+use App\Models\Shopify\ShopifyProductVariant;
 
 class UpdateInventory extends Command
 {
@@ -36,7 +36,7 @@ class UpdateInventory extends Command
         $marketplace = 'Shopify';
         $jobType = 'shopifyUpdateInventory';
 
-        $job = SyncJobController::getJob($jobType, $marketplace);
+        $job = (new SyncJobService())->getJob($jobType, $marketplace);
 
         if (!$job->isRunning()) {
             try {

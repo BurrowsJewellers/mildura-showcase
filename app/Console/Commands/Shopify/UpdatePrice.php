@@ -4,10 +4,10 @@ namespace App\Console\Commands\Shopify;
 
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
-use App\Http\Controllers\SyncJobController;
-use App\Models\ShopifyProductVariant;
+use Shopify\Rest\Admin2024_07\Variant;
 use App\Services\ShopifyService;
-use Shopify\Rest\Admin2024_01\Variant;
+use App\Services\SyncJobService;
+use App\Models\Shopify\ShopifyProductVariant;
 
 class UpdatePrice extends Command
 {
@@ -33,7 +33,7 @@ class UpdatePrice extends Command
         $marketplace = 'Shopify';
         $jobType = 'shopifyUpdatePrice';
 
-        $job = SyncJobController::getJob($jobType, $marketplace);
+        $job = (new SyncJobService())->getJob($jobType, $marketplace);
 
         if (!$job->isRunning()) {
             try {

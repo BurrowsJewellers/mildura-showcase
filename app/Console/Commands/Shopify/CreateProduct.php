@@ -3,13 +3,13 @@
 namespace App\Console\Commands\Shopify;
 
 use Illuminate\Console\Command;
-use Illuminate\Support\Facades\Log;
-use App\Http\Controllers\SyncJobController;
-use Shopify\Clients\Rest;
-use App\Models\Brand;
-use App\Models\RetailEdgeProduct;
-use App\Services\ShopifyService;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Shopify\Clients\Rest;
+use App\Services\ShopifyService;
+use App\Services\SyncJobService;
+use App\Models\EWeb\Brand;
+use App\Models\EWeb\RetailEdgeProduct;
 
 class CreateProduct extends Command
 {
@@ -35,12 +35,12 @@ class CreateProduct extends Command
         $marketplace = 'Shopify';
         $jobType = 'shopifyCreateProduct';
 
-        $job = SyncJobController::getJob($jobType, $marketplace);
+        $job = (new SyncJobService())->getJob($jobType, $marketplace);
 
         if (!$job->isRunning()) {
             try {
                 Log::info("$marketplace $jobType started!");
-                $job->update(['status' => 1]);
+                // $job->update(['status' => 1]);
 
                 $pendingProducts = DB::select("SELECT rep.id, rep.sku
                     FROM retail_edge_products rep
@@ -55,7 +55,6 @@ class CreateProduct extends Command
                 }
 
                 $session = (new ShopifyService)->getSession();
-                $variantTypes = ['vt1' => 'Size', 'vt2' => 'Color', 'vt3' => 'Material', 'vt4' => 'Style'];
 
                 $brands = Brand::all();
 
@@ -81,9 +80,7 @@ class CreateProduct extends Command
                     if ($product) {
                         $this->info('======================================');
                         $variants = [];
-                        $variantOptions = [];
                         if ($product->children->count()) {
-                            $optionIndex = 1;
                             foreach ($product->children as $child) {
                                 $variant = [];
                                 $variant['sku'] = $child->sku;
@@ -109,100 +106,22 @@ class CreateProduct extends Command
                                 $variant['barcode'] = $child->barcode;
                                 $variant['compare_at_price'] = ($price == $compareAtPrice) ? 0 : $compareAtPrice;
                                 $variant['inventory_management'] = 'shopify';
-
-                                $vts = array_filter(array_map('trim', array_map('strtolower', explode("-", $child->id3))));
-
-                                foreach ($vts as $vt) {
-                                    $vt = trim($vt);
-
-                                    if (isset($variantTypes[$vt])) {
-                                        $variantType = $variantTypes[$vt];
-                                        $variantTypeValue = '';
-
-                                        if ($vt == 'vt1') {
-                                            if ($child->s_cat == 'Rings') {
-                                                $optionIndex = array_search($vt, $vts) + 1;
-                                                $variant["option{$optionIndex}"] = $child->ring_size;
-                                                $variantTypeValue = $child->ring_size;
-                                            }
-
-                                            if ($child->s_cat == 'Bracelets') {
-                                                $optionIndex = array_search($vt, $vts) + 1;
-                                                $variant["option{$optionIndex}"] = $child->bracelet_length;
-                                                $variantTypeValue = $child->ring_size;
-                                            }
-                                        }
-
-                                        if ($vt == 'vt2') {
-                                            $optionIndex = array_search($vt, $vts) + 1;
-                                            $variant["option{$optionIndex}"] = $child->metal_colour;
-                                            $variantTypeValue = $child->metal_colour;
-                                        }
-
-                                        if ($vt == 'vt3') {
-                                            $optionIndex = array_search($vt, $vts) + 1;
-                                            $variant["option{$optionIndex}"] = $child->s_metal_type;
-                                            $variantTypeValue = $child->s_metal_type;
-                                        }
-
-                                        if ($vt == 'vt4') {
-                                            $optionIndex = array_search($vt, $vts) + 1;
-                                            $variant["option{$optionIndex}"] = $child->pendant_style;
-                                            $variantTypeValue = $child->pendant_style;
-                                        }
-
-                                        if (!isset($variantOptions[$variantType])) {
-                                            $variantOptions[$variantType][] = $variantTypeValue;
-                                        } else {
-                                            if (!in_array($variantTypeValue, $variantOptions[$variantType])) {
-                                                $variantOptions[$variantType][] = $variantTypeValue;
-                                            }
-                                        }
-                                    }
-                                }
                                 $variants[] = $variant;
                             }
                         }
 
-                        $options = [];
-
-                        foreach ($variantOptions as $variantType => $variantValues) {
-                            $option = [];
-                            $option['name'] = ucfirst($variantType);
-
-                            if (is_array($variantValues)) {
-                                $option['values'] = array_unique($variantValues);
-                            } else {
-                                $option['values'] = $variantValues;
-                            }
-
-                            $options[] = $option;
-                        }
-
                         $mktDescription = $product->marketing_description;
-
-                        if ($product->brand?->name == 'Pandora') {
-                            // $mktDescription .= "Brand: " . $product->brand?->name;
-                            $mktDescription .= " - Design number: " . $product->real_design_number;
-                        }
 
                         $productData['product'] = [
                             'title' => $product->title,
                             'body_html' => $mktDescription,
                             'variants' => $variants,
-                            'options' => $options,
                             'product_type' => $product->s_cat,
                         ];
 
                         $productData['product']['vendor'] = $product->brand?->name;
 
                         $productTags = $this->calculateTags($product);
-
-                        if ($product->brand?->name == 'Pandora') {
-                            $productTags[] = 'Pandora';
-                            $productData['product']['template_suffix'] = 'no-buy';
-                        }
-
                         $productData['product']['tags'] = implode(",", $productTags);
 
                         $data = json_encode($productData);

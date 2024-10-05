@@ -2,15 +2,15 @@
 
 namespace App\Console\Commands\Shopify;
 
-use App\Http\Controllers\SyncJobController;
-use App\Models\ShopifyInventoryLevel;
-use App\Models\ShopifyLocation;
-use App\Models\ShopifyProduct;
-use App\Services\ShopifyService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Shopify\Clients\Rest;
+use App\Services\ShopifyService;
+use App\Services\SyncJobService;
+use App\Models\Shopify\ShopifyInventoryLevel;
+use App\Models\Shopify\ShopifyLocation;
+use App\Models\Shopify\ShopifyProduct;
 
 class GetProducts extends Command
 {
@@ -36,7 +36,7 @@ class GetProducts extends Command
         $marketplace = 'Shopify';
         $jobType = 'shopifyGetProducts';
 
-        $job = SyncJobController::getJob($jobType, $marketplace);
+        $job = (new SyncJobService())->getJob($jobType, $marketplace);
 
         if (!$job->isRunning()) {
             try {
@@ -260,7 +260,7 @@ class GetProducts extends Command
                 $this->info($message);
                 Log::debug($message);
             } catch (\Exception $e) {
-                DB::statement('SET FOREIGN_KEY_CHECKS = 1;');
+                // DB::statement('SET FOREIGN_KEY_CHECKS = 1;');
                 $message = 'Error while deleting shopify product. ' . $e->getMessage();
                 $this->info($message);
                 Log::debug($message);

@@ -34,7 +34,7 @@ class GetWebhooks extends Command
         $marketplace = 'Shopify';
         $jobType = 'shopifyGetWebhooks';
 
-        $job = SyncJobController::getJob($jobType, $marketplace);
+        $job = (new SyncJobService())->getJob($jobType, $marketplace);
 
         if (!$job->isRunning()) {
             try {

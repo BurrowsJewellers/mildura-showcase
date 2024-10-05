@@ -4,12 +4,12 @@ namespace App\Console\Commands\Shopify;
 
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
-use App\Http\Controllers\SyncJobController;
-use App\Models\Brand;
-use App\Models\RetailEdgeProduct;
-use App\Models\ShopifyProductVariant;
+use Shopify\Rest\Admin2024_07\Product;
 use App\Services\ShopifyService;
-use Shopify\Rest\Admin2024_01\Product;
+use App\Services\SyncJobService;
+use App\Models\EWeb\Brand;
+use App\Models\EWeb\RetailEdgeProduct;
+use App\Models\Shopify\ShopifyProductVariant;
 
 class UpdateProduct extends Command
 {
@@ -35,7 +35,7 @@ class UpdateProduct extends Command
         $marketplace = 'Shopify';
         $jobType = 'shopifyUpdateProduct';
 
-        $job = SyncJobController::getJob($jobType, $marketplace);
+        $job = (new SyncJobService())->getJob($jobType, $marketplace);
 
         if (!$job->isRunning()) {
             try {
@@ -58,22 +58,12 @@ class UpdateProduct extends Command
                     $this->info('Updating: ' . $variant->sku);
                     $productTags = $this->calculateTags($variant->retailEdgeProduct, $variant->product->tags);
 
-                    if ($variant->retailEdgeProduct->brand?->name == 'Pandora') {
-                        $productTags[] = 'Pandora';
-                    }
-
                     $tags = implode(",", $productTags);
 
                     try {
                         $product = new Product($session);
                         $product->id = $variant->product_id;
                         $product->tags = $tags;
-
-                        if ($variant->retailEdgeProduct->brand?->name == 'Pandora') {
-                            $product->template_suffix = 'no-buy';
-                            $product->vendor = $variant->retailEdgeProduct->brand?->name;
-                        }
-
                         $product->save(true);
 
                         $variant->update(['requires_update' => 0]);

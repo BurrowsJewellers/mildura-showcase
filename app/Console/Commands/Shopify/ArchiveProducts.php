@@ -3,12 +3,12 @@
 namespace App\Console\Commands\Shopify;
 
 use Illuminate\Console\Command;
-use Illuminate\Support\Facades\Log;
-use App\Http\Controllers\SyncJobController;
-use App\Models\ShopifyProduct;
-use App\Services\ShopifyService;
 use Illuminate\Support\Facades\DB;
-use Shopify\Rest\Admin2024_01\Product;
+use Illuminate\Support\Facades\Log;
+use Shopify\Rest\Admin2024_07\Product;
+use App\Services\ShopifyService;
+use App\Services\SyncJobService;
+use App\Models\Shopify\ShopifyProduct;
 
 class ArchiveProducts extends Command
 {
@@ -34,7 +34,7 @@ class ArchiveProducts extends Command
         $marketplace = 'Shopify';
         $jobType = 'shopifyArchiveProducts';
 
-        $job = SyncJobController::getJob($jobType, $marketplace);
+        $job = (new SyncJobService())->getJob($jobType, $marketplace);
 
         if (!$job->isRunning()) {
             try {
