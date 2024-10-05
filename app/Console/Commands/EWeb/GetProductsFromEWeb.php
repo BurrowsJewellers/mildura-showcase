@@ -7,8 +7,8 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use App\Services\EWebService;
 use App\Services\SyncJobService;
-use App\Models\Eweb\RetailEdgeProduct;
-use App\Models\Eweb\RetailEdgeProductImage;
+use App\Models\EWeb\RetailEdgeProduct;
+use App\Models\EWeb\RetailEdgeProductImage;
 
 class GetProductsFromEWeb extends Command
 {

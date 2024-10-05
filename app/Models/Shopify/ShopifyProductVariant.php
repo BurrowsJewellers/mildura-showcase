@@ -4,8 +4,8 @@ namespace App\Models\Shopify;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
-use App\Models\Eweb\RetailEdgeProduct;
-use App\Models\Eweb\RetailEdgeProductImage;
+use App\Models\EWeb\RetailEdgeProduct;
+use App\Models\EWeb\RetailEdgeProductImage;
 
 class ShopifyProductVariant extends Model
 {
