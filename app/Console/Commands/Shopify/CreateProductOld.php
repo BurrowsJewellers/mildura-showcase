@@ -11,14 +11,14 @@ use App\Services\SyncJobService;
 use App\Models\EWeb\Brand;
 use App\Models\EWeb\RetailEdgeProduct;
 
-class CreateProduct extends Command
+class CreateProductOld extends Command
 {
     /**
      * The name and signature of the console command.
      *
      * @var string
      */
-    protected $signature = 'shopifyCreateProduct';
+    protected $signature = 'shopifyCreateProductOld';
 
     /**
      * The console command description.
@@ -33,7 +33,7 @@ class CreateProduct extends Command
     public function handle()
     {
         $marketplace = 'Shopify';
-        $jobType = 'shopifyCreateProduct';
+        $jobType = 'shopifyCreateProductOld';
 
         $job = (new SyncJobService())->getJob($jobType, $marketplace);
 
@@ -65,17 +65,23 @@ class CreateProduct extends Command
                     $brandsArray[$brand->brand_id]['name'] = $brand->name;
                 }
 
-                $countQuery = RetailEdgeProduct::whereIn('id', $pendingProductIds)->where('uploaded_to_shopify', 0)->where('quantity', '>', 0);
+                $countQuery = RetailEdgeProduct::whereIn('id', $pendingProductIds)->whereHas('children', function ($children) {
+                    $children->where('uploaded_to_shopify', 0);
+                })->where('quantity', '>', 0);
 
                 $count = $countQuery->count();
 
                 while ($count) {
                     $this->info('Count: ' . $count);
-                    $product = RetailEdgeProduct::with(['brand'])->where('uploaded_to_shopify', 0)->where('quantity', '>', 0)->first();
+                    $product = RetailEdgeProduct::withWhereHas('children', function ($children) {
+                        $children->where('uploaded_to_shopify', 0);
+                    })->with(['brand'])->where('quantity', '>', 0)->first();
 
                     if ($product) {
                         $this->info('======================================');
                         $variants = [];
+                        if ($product->children->count()) {
+                            foreach ($product->children as $child) {
                                 $variant = [];
                                 $variant['sku'] = $child->sku;
 
@@ -101,6 +107,8 @@ class CreateProduct extends Command
                                 $variant['compare_at_price'] = ($price == $compareAtPrice) ? 0 : $compareAtPrice;
                                 $variant['inventory_management'] = 'shopify';
                                 $variants[] = $variant;
+                            }
+                        }
 
                         $mktDescription = $product->marketing_description;
 
