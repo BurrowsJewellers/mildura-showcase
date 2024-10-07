@@ -76,31 +76,31 @@ class CreateProduct extends Command
                     if ($product) {
                         $this->info('======================================');
                         $variants = [];
-                                $variant = [];
-                                $variant['sku'] = $child->sku;
+                        $variant = [];
+                        $variant['sku'] = $product->sku;
 
-                                $retailPrices = [$child->retail_price1, $child->retail_price2];
+                        $retailPrices = [$product->retail_price1, $product->retail_price2];
 
-                                // Convert all prices to float and filter out non-positive values
-                                $prices = array_filter(array_map('floatval', $retailPrices), function ($price) {
-                                    return $price > 0;
-                                });
+                        // Convert all prices to float and filter out non-positive values
+                        $prices = array_filter(array_map('floatval', $retailPrices), function ($price) {
+                            return $price > 0;
+                        });
 
-                                // Set default values
-                                $price = 0;
-                                $compareAtPrice = 0;
+                        // Set default values
+                        $price = 0;
+                        $compareAtPrice = 0;
 
-                                // Find the lower price and higher compare_at_price
-                                if (!empty($prices)) {
-                                    $price = min($prices);
-                                    $compareAtPrice = max($prices);
-                                }
+                        // Find the lower price and higher compare_at_price
+                        if (!empty($prices)) {
+                            $price = min($prices);
+                            $compareAtPrice = max($prices);
+                        }
 
-                                $variant['price'] = $price;
-                                $variant['barcode'] = $child->barcode;
-                                $variant['compare_at_price'] = ($price == $compareAtPrice) ? 0 : $compareAtPrice;
-                                $variant['inventory_management'] = 'shopify';
-                                $variants[] = $variant;
+                        $variant['price'] = $price;
+                        $variant['barcode'] = $product->barcode;
+                        $variant['compare_at_price'] = ($price == $compareAtPrice) ? 0 : $compareAtPrice;
+                        $variant['inventory_management'] = 'shopify';
+                        $variants[] = $variant;
 
                         $mktDescription = $product->marketing_description;
 
@@ -132,11 +132,11 @@ class CreateProduct extends Command
                                 Log::debug('Shopify product ' . $product->sku . ' created successfully!');
 
                                 foreach ($product->children as $child) {
-                                    $child->update(['uploaded_to_shopify' => 1]);
+                                    $product->update(['uploaded_to_shopify' => 1]);
                                 }
                             } else {
                                 foreach ($product->children as $child) {
-                                    $child->update(['uploaded_to_shopify' => 2]);
+                                    $product->update(['uploaded_to_shopify' => 2]);
                                 }
 
                                 $message = 'Error while creating product. Sku :' . $product->sku . ', title: '  . $product->title;
