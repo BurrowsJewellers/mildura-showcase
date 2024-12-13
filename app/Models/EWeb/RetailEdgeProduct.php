@@ -13,9 +13,11 @@ class RetailEdgeProduct extends Model
 
     protected $fillable = [
         'sku',
+        'origional_sku',
         'title',
         'marketing_description',
         'brand_id',
+        'category_id',
         'barcode',
         'retail_price1',
         'retail_price2',

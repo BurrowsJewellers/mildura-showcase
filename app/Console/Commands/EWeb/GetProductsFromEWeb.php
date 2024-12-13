@@ -127,9 +127,11 @@ class GetProductsFromEWeb extends Command
                         RetailEdgeProduct::create(
                             [
                                 'sku' => $sku,
+                                'origional_sku' => trim($item->SKU),
                                 'title' => trim($item->ShortMarketingDescription),
                                 'marketing_description' => $item->MarketingDescription,
                                 'brand_id' => trim($item->BrandID),
+                                'category_id' => trim($item->CategoryID),
                                 'barcode' => trim($item->Barcode),
                                 'retail_price1' => $item->RetailPrice,
                                 'retail_price2' => $item->RetailPrice2,
