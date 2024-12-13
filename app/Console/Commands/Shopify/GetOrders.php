@@ -34,11 +34,8 @@ class GetOrders extends Command
     public function handle()
     {
         try {
-
-            $this->pushOrdersToRetailEdge();
-
-            exit;
             $this->getOrders();
+            $this->pushOrdersToRetailEdge();
         } catch (\Exception $e) {
             report($e);
             var_dump($e->getMessage());
