@@ -17,6 +17,8 @@ Schedule::command(GetBrandsFromEWeb::class)->daily();
 
 Schedule::command(UploadImages::class)->everyThreeHours();
 
+Schedule::command(GetProductsFromEWeb::class)->everyFifteenMinutes();
+
 Schedule::command(GetProductsFromEWeb::class)->everyFifteenMinutes()->after(function(){
     Artisan::call('shopifyUpdateInventory');
     Artisan::call('shopifyUpdatePrice');
