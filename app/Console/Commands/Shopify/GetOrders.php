@@ -53,7 +53,7 @@ class GetOrders extends Command
                 [],
                 [
                     "status" => "any",
-                    "updated_at_min" => now()->subDays(60)->toIso8601String(),
+                    "updated_at_min" => now()->subMinutes(35)->toIso8601String(),
                     "limit" => 250
                 ]
             );
