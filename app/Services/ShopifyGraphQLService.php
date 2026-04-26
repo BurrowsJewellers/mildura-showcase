@@ -34,7 +34,21 @@ class ShopifyGraphQLService extends ShopifyConnectionService
                 'variables' => $variables,
             ]);
 
-            $body = $response->getDecodedBody();
+            try {
+                $body = $response->getDecodedBody();
+            } catch (\JsonException $jsonException) {
+                $raw = '';
+                try {
+                    $response->getBody()->rewind();
+                    $raw = $response->getBody()->getContents();
+                } catch (\Throwable $ignored) {
+                }
+
+                $status = method_exists($response, 'getStatusCode') ? $response->getStatusCode() : 'unknown';
+                $snippet = mb_substr(trim($raw), 0, 500);
+                Log::error("GraphQL non-JSON response (HTTP {$status}): {$snippet}");
+                throw new Exception("Shopify returned non-JSON response (HTTP {$status}): {$snippet}", 0, $jsonException);
+            }
 
             // Check for GraphQL errors
             if (isset($body['errors']) && ! empty($body['errors'])) {
@@ -124,7 +138,7 @@ class ShopifyGraphQLService extends ShopifyConnectionService
                 $variables['after'] = $cursor;
             }
 
-            $response = $this->query($query, $variables);
+            $response = $this->queryWithRetry($query, $variables);
 
             // Navigate to the connection
             $connection = $this->getNestedValue($response, $connectionPath);
@@ -161,6 +175,35 @@ class ShopifyGraphQLService extends ShopifyConnectionService
             // Rate limit protection
             usleep(500000); // 0.5 second delay between requests
         }
+    }
+
+    /**
+     * Run a single GraphQL request with retry/backoff. Used by paginate so a
+     * transient 5xx or non-JSON body on one page doesn't abort a long walk.
+     * Mutations should keep calling query()/mutate() directly to avoid
+     * accidental double-applies on retry.
+     */
+    protected function queryWithRetry(string $query, array $variables, int $maxAttempts = 4): array
+    {
+        $attempt = 0;
+        $lastException = null;
+
+        while ($attempt < $maxAttempts) {
+            try {
+                return $this->query($query, $variables);
+            } catch (Exception $e) {
+                $lastException = $e;
+                $attempt++;
+                if ($attempt >= $maxAttempts) {
+                    break;
+                }
+                $delay = min(30, 2 ** $attempt);
+                Log::warning("GraphQL request failed (attempt {$attempt}/{$maxAttempts}); retrying in {$delay}s: ".$e->getMessage());
+                sleep($delay);
+            }
+        }
+
+        throw $lastException;
     }
 
     /**
