@@ -77,19 +77,18 @@ class DedupeProducts extends Command
      */
     protected function collectProductsBySku(): \Illuminate\Support\Collection
     {
-        $bySku = collect();
+        $bySku = [];
 
         $this->graphqlService->paginate(
             ProductQueries::getProductsForDedupe(),
             ['first' => 100],
-            function (array $product) use ($bySku) {
+            function (array $product) use (&$bySku) {
                 $skus = collect($product['variants']['nodes'] ?? [])
                     ->map(fn ($variant) => $variant['inventoryItem']['sku'] ?? null)
                     ->filter()
                     ->unique();
 
                 foreach ($skus as $sku) {
-                    $bySku[$sku] = $bySku->get($sku, []);
                     $bySku[$sku][] = [
                         'gid' => $product['id'],
                         'rest_id' => $this->graphqlService->extractRestId($product['id']),
@@ -104,7 +103,7 @@ class DedupeProducts extends Command
             'products'
         );
 
-        return $bySku;
+        return collect($bySku);
     }
 
     /**
