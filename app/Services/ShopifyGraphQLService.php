@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Exceptions\ShopifyGraphQLException;
 use Exception;
 use Illuminate\Support\Facades\Log;
 use Shopify\Clients\Graphql;
@@ -10,6 +11,9 @@ use Shopify\Clients\HttpResponse;
 class ShopifyGraphQLService extends ShopifyConnectionService
 {
     protected Graphql $client;
+
+    /** Cost extensions from the most recent successful (or errored) response. */
+    protected ?array $lastCost = null;
 
     /**
      * Initialize GraphQL client
@@ -50,15 +54,15 @@ class ShopifyGraphQLService extends ShopifyConnectionService
                 throw new Exception("Shopify returned non-JSON response (HTTP {$status}): {$snippet}", 0, $jsonException);
             }
 
+            // Capture cost extensions even on error responses so retry logic
+            // can pace itself off the latest throttleStatus.
+            $this->lastCost = $body['extensions']['cost'] ?? null;
+
             // Check for GraphQL errors
             if (isset($body['errors']) && ! empty($body['errors'])) {
-                $errorMessages = array_map(function ($error) {
-                    return $error['message'] ?? 'Unknown error';
-                }, $body['errors']);
-
-                $errorString = implode(', ', $errorMessages);
-                Log::error('GraphQL query error: '.$errorString);
-                throw new Exception('GraphQL query error: '.$errorString);
+                $exception = ShopifyGraphQLException::fromErrors($body['errors'], $this->lastCost);
+                Log::error('GraphQL query error ['.($exception->apiCode ?? 'unknown').']: '.$exception->getMessage());
+                throw $exception;
             }
 
             // Check for user errors in mutations
@@ -172,8 +176,9 @@ class ShopifyGraphQLService extends ShopifyConnectionService
                 break;
             }
 
-            // Rate limit protection
-            usleep(500000); // 0.5 second delay between requests
+            // Pace ourselves against the leaky-bucket throttleStatus so a long
+            // walk doesn't stall by burning the budget faster than it restores.
+            usleep($this->computeAdaptiveSleepMicros());
         }
     }
 
@@ -191,6 +196,27 @@ class ShopifyGraphQLService extends ShopifyConnectionService
         while ($attempt < $maxAttempts) {
             try {
                 return $this->query($query, $variables);
+            } catch (ShopifyGraphQLException $e) {
+                $lastException = $e;
+
+                if (! $e->isRetriable()) {
+                    Log::error("GraphQL non-retriable error [{$e->apiCode}]: ".$e->getMessage());
+                    throw $e;
+                }
+
+                $attempt++;
+                if ($attempt >= $maxAttempts) {
+                    break;
+                }
+
+                $suggested = $e->suggestedRetryDelaySeconds();
+                $delay = $suggested !== null
+                    ? (int) ceil($suggested)
+                    : min(30, 2 ** $attempt);
+
+                $codeLabel = $e->apiCode ?? 'GraphQL error';
+                Log::warning("GraphQL {$codeLabel} (attempt {$attempt}/{$maxAttempts}); retrying in {$delay}s: ".$e->getMessage());
+                sleep($delay);
             } catch (Exception $e) {
                 $lastException = $e;
                 $attempt++;
@@ -204,6 +230,37 @@ class ShopifyGraphQLService extends ShopifyConnectionService
         }
 
         throw $lastException;
+    }
+
+    /**
+     * Decide how long to sleep between paginated calls. Uses the most recent
+     * throttleStatus: if the bucket has plenty of headroom for two more calls
+     * we keep moving with a small floor; if it's running low we wait long
+     * enough to have headroom on the next request, capped at 5s so a stuck
+     * read doesn't block forever.
+     */
+    protected function computeAdaptiveSleepMicros(): int
+    {
+        $cost = $this->lastCost;
+
+        if (! $cost) {
+            return 500_000;
+        }
+
+        $requested = (float) ($cost['requestedQueryCost'] ?? 0);
+        $available = (float) ($cost['throttleStatus']['currentlyAvailable'] ?? 1000);
+        $rate = (float) ($cost['throttleStatus']['restoreRate'] ?? 50);
+
+        $target = max($requested, 1.0) * 2;
+
+        if ($available >= $target || $rate <= 0) {
+            return 100_000;
+        }
+
+        $seconds = ($target - $available) / $rate;
+        $seconds = min(5.0, max(0.1, $seconds));
+
+        return (int) round($seconds * 1_000_000);
     }
 
     /**
