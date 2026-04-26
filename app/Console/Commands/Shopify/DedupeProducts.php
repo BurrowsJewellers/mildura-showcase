@@ -78,11 +78,16 @@ class DedupeProducts extends Command
     protected function collectProductsBySku(): \Illuminate\Support\Collection
     {
         $bySku = [];
+        $seen = 0;
+
+        $this->info('Walking Shopify catalog (100/page) to group by SKU…');
 
         $this->graphqlService->paginate(
             ProductQueries::getProductsForDedupe(),
             ['first' => 100],
-            function (array $product) use (&$bySku) {
+            function (array $product) use (&$bySku, &$seen) {
+                $seen++;
+
                 $skus = collect($product['variants']['nodes'] ?? [])
                     ->map(fn ($variant) => $variant['inventoryItem']['sku'] ?? null)
                     ->filter()
@@ -99,9 +104,15 @@ class DedupeProducts extends Command
                         'has_media' => ! empty($product['media']['nodes'] ?? []),
                     ];
                 }
+
+                if ($seen % 500 === 0) {
+                    $this->line("  …scanned {$seen} products");
+                }
             },
             'products'
         );
+
+        $this->info("Scanned {$seen} products total.");
 
         return collect($bySku);
     }
