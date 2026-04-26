@@ -15,28 +15,22 @@ return new class extends Migration
      */
     public function up(): void
     {
-        DB::statement('LOCK TABLES sync_jobs WRITE');
+        DB::statement('
+            DELETE sj FROM sync_jobs sj
+            INNER JOIN (
+                SELECT MIN(id) AS keep_id, type, marketplace
+                FROM sync_jobs
+                GROUP BY type, marketplace
+                HAVING COUNT(*) > 1
+            ) keepers
+              ON sj.type = keepers.type
+             AND (sj.marketplace <=> keepers.marketplace)
+            WHERE sj.id <> keepers.keep_id
+        ');
 
-        try {
-            DB::statement('
-                DELETE sj FROM sync_jobs sj
-                INNER JOIN (
-                    SELECT MIN(id) AS keep_id, type, marketplace
-                    FROM sync_jobs
-                    GROUP BY type, marketplace
-                    HAVING COUNT(*) > 1
-                ) keepers
-                  ON sj.type = keepers.type
-                 AND (sj.marketplace <=> keepers.marketplace)
-                WHERE sj.id <> keepers.keep_id
-            ');
-
-            Schema::table('sync_jobs', function (Blueprint $table) {
-                $table->unique(['type', 'marketplace'], 'sync_jobs_type_marketplace_unique');
-            });
-        } finally {
-            DB::statement('UNLOCK TABLES');
-        }
+        Schema::table('sync_jobs', function (Blueprint $table) {
+            $table->unique(['type', 'marketplace'], 'sync_jobs_type_marketplace_unique');
+        });
     }
 
     public function down(): void
