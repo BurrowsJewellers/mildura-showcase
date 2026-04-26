@@ -35,28 +35,27 @@ class UpdatePriceGraphQL extends Command
         $marketplace = 'Shopify';
         $jobType = 'shopifyUpdatePriceGraphQL';
 
-        $job = (new SyncJobService)->getJob($jobType, $marketplace);
+        $job = (new SyncJobService)->claim($jobType, $marketplace);
 
-        if (! $job->isRunning()) {
-            try {
-                Log::info("$marketplace $jobType started!");
-                $job->update(['status' => 1]);
-
-                $this->graphqlService = new ShopifyGraphQLService;
-
-                // Process price updates in batches
-                $this->processPriceUpdates();
-
-                $job->update(['status' => 0, 'message' => null]);
-                Log::info("$marketplace $jobType finished!");
-
-            } catch (\Exception $e) {
-                $job->update(['status' => 0, 'message' => $e->getMessage()]);
-                report($e);
-                $this->error($e->getMessage());
-            }
-        } else {
+        if (! $job) {
             Log::info("$marketplace $jobType is already running.");
+
+            return;
+        }
+
+        try {
+            Log::info("$marketplace $jobType started!");
+
+            $this->graphqlService = new ShopifyGraphQLService;
+
+            $this->processPriceUpdates();
+
+            $job->update(['status' => 0, 'message' => null]);
+            Log::info("$marketplace $jobType finished!");
+        } catch (\Exception $e) {
+            $job->update(['status' => 0, 'message' => $e->getMessage()]);
+            report($e);
+            $this->error($e->getMessage());
         }
     }
 

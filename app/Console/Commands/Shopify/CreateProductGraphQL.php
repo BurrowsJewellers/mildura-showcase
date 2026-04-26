@@ -6,173 +6,152 @@ use App\Models\EWeb\RetailEdgeProduct;
 use App\Models\Shopify\ShopifyProduct;
 use App\Models\Shopify\ShopifyProductVariant;
 use App\Services\GraphQL\ProductMutations;
+use App\Services\GraphQL\ProductQueries;
 use App\Services\ShopifyGraphQLService;
 use App\Services\SyncJobService;
 use Illuminate\Console\Command;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 class CreateProductGraphQL extends Command
 {
-    /**
-     * The name and signature of the console command.
-     *
-     * @var string
-     */
     protected $signature = 'shopify:create-product-graphql';
 
-    /**
-     * The console command description.
-     *
-     * @var string
-     */
     protected $description = 'Create products in Shopify using GraphQL API';
 
     protected ShopifyGraphQLService $graphqlService;
 
-    /**
-     * Execute the console command.
-     */
     public function handle()
     {
         $marketplace = 'Shopify';
         $jobType = 'shopifyCreateProductGraphQL';
 
-        $job = (new SyncJobService)->getJob($jobType, $marketplace);
+        $job = (new SyncJobService)->claim($jobType, $marketplace);
 
-        if (! $job->isRunning()) {
-            try {
-                Log::info("$marketplace $jobType started!");
-                $job->update(['status' => 1]);
-
-                $this->graphqlService = new ShopifyGraphQLService;
-
-                // Get pending products
-                $pendingProducts = DB::select('
-                    SELECT rep.id, rep.sku
-                    FROM retail_edge_products rep
-                    LEFT JOIN shopify_product_variants spv ON rep.sku = spv.sku
-                    WHERE spv.id IS NULL
-                ');
-
-                $pendingProductIds = array_column($pendingProducts, 'id');
-
-                if (empty($pendingProductIds)) {
-                    $this->info('No pending products to create.');
-                    $job->update(['status' => 0, 'message' => null]);
-
-                    return;
-                }
-
-                // Process products
-                $countQuery = RetailEdgeProduct::whereIn('id', $pendingProductIds)
-                    ->where('uploaded_to_shopify', 0)
-                    ->where('quantity', '>', 0);
-
-                $count = $countQuery->count();
-
-                while ($count) {
-                    $this->info("Remaining products to create: {$count}");
-
-                    $product = RetailEdgeProduct::with(['brand'])
-                        ->where('uploaded_to_shopify', 0)
-                        ->where('quantity', '>', 0)
-                        ->first();
-
-                    if ($product) {
-                        $this->createProductInShopify($product);
-                        usleep(1500000); // Rate limiting
-                    }
-
-                    $count = $countQuery->count();
-                }
-
-                $job->update(['status' => 0, 'message' => null]);
-                Log::info("$marketplace $jobType finished!");
-
-            } catch (\Exception $e) {
-                $job->update(['status' => 0, 'message' => $e->getMessage()]);
-                report($e);
-                $this->error($e->getMessage());
-            }
-        } else {
+        if (! $job) {
             Log::info("$marketplace $jobType is already running.");
+
+            return;
+        }
+
+        try {
+            Log::info("$marketplace $jobType started!");
+
+            $this->graphqlService = new ShopifyGraphQLService;
+
+            $pendingQuery = fn () => RetailEdgeProduct::with(['brand'])
+                ->where('uploaded_to_shopify', 0)
+                ->where('quantity', '>', 0)
+                ->whereNotNull('sku')
+                ->whereNotExists(function ($query) {
+                    $query->select(DB::raw(1))
+                        ->from('shopify_product_variants')
+                        ->whereColumn('shopify_product_variants.sku', 'retail_edge_products.sku');
+                });
+
+            $count = $pendingQuery()->count();
+
+            if ($count === 0) {
+                $this->info('No pending products to create.');
+                $job->update(['status' => 0, 'message' => null]);
+
+                return;
+            }
+
+            while ($count > 0) {
+                $this->info("Remaining products to create: {$count}");
+
+                $product = $pendingQuery()->first();
+
+                if (! $product) {
+                    break;
+                }
+
+                $this->createProductInShopify($product);
+                usleep(1500000);
+
+                $count = $pendingQuery()->count();
+            }
+
+            $job->update(['status' => 0, 'message' => null]);
+            Log::info("$marketplace $jobType finished!");
+        } catch (\Exception $e) {
+            $job->update(['status' => 0, 'message' => $e->getMessage()]);
+            report($e);
+            $this->error($e->getMessage());
         }
     }
 
     /**
-     * Create a product in Shopify using GraphQL
+     * Create a product in Shopify using GraphQL.
+     *
+     * Flow:
+     *   1. Adopt: if Shopify already has a product with this SKU, link to it
+     *      locally and stop. Stops duplicate creation when a previous run
+     *      created the product upstream but failed to write locally.
+     *   2. productCreate (creates product + a default variant with no SKU).
+     *   3. productVariantsBulkUpdate populates the default variant: sku
+     *      (under inventoryItem from API 2024-04+), price, compareAtPrice,
+     *      barcode, inventoryPolicy, taxable, tracked, requiresShipping.
+     *   4. Local DB write inside a transaction. On unique-SKU conflict, the
+     *      upstream product is deleted so we don't leave an orphan.
      */
     protected function createProductInShopify(RetailEdgeProduct $product)
     {
         try {
             $this->info("Creating product: {$product->title} (SKU: {$product->sku})");
 
-            // Prepare variant data
-            $retailPrices = [$product->retail_price1, $product->retail_price2];
-            $prices = array_filter(array_map('floatval', $retailPrices), function ($price) {
-                return $price > 0;
-            });
-
-            $price = ! empty($prices) ? min($prices) : 0;
-            $compareAtPrice = ! empty($prices) ? max($prices) : 0;
-
-            if ($price == $compareAtPrice) {
-                $compareAtPrice = null; // Don't set compare price if same as regular price
+            if ($this->adoptExistingShopifyProductBySku($product)) {
+                return;
             }
 
-            // Build product input (GraphQL format - no variants here)
+            [$price, $compareAtPrice] = $this->resolvePrices($product);
+
             $productInput = [
                 'title' => $product->title,
                 'descriptionHtml' => $product->marketing_description ?? '',
                 'vendor' => $product->brand?->name ?? '',
                 'productType' => $product->s_cat ?? '',
                 'tags' => $this->calculateTags($product),
-                'status' => 'ACTIVE', // GraphQL enum (REST equivalent: 'active')
+                'status' => 'ACTIVE',
             ];
 
-            // Step 1: Create the product (without variants)
             $response = $this->graphqlService->mutate(
                 ProductMutations::createProduct(),
-                ['input' => $productInput]
+                ['product' => $productInput]
             );
 
             if (! isset($response['productCreate']['product'])) {
-                // Handle product creation errors
-                $errors = [];
-                if (isset($response['productCreate']['userErrors'])) {
-                    $errors = array_map(function ($error) {
-                        return $error['message'];
-                    }, $response['productCreate']['userErrors']);
-                }
-
-                $errorMessage = ! empty($errors) ? implode(', ', $errors) : 'Unknown error creating product';
-                $this->error("Failed to create product: {$errorMessage}");
-                Log::error("Error creating product {$product->sku}: {$errorMessage}");
-                $product->update(['uploaded_to_shopify' => 2]);
-
-                foreach ($product->children as $child) {
-                    $child->update(['uploaded_to_shopify' => 2]);
-                }
+                $this->markCreateFailed($product, $response['productCreate']['userErrors'] ?? [], 'product');
 
                 return;
             }
 
             $createdProduct = $response['productCreate']['product'];
             $productGid = $createdProduct['id'];
+            $defaultVariant = $createdProduct['variants']['nodes'][0] ?? null;
 
-            // Step 2: Create the variant separately (matching REST values)
+            if (! $defaultVariant) {
+                $this->error("productCreate did not return a default variant for SKU {$product->sku}");
+                Log::error("productCreate did not return a default variant for SKU {$product->sku}");
+                $this->deleteUpstreamProduct($productGid);
+                $product->update(['uploaded_to_shopify' => 2]);
+
+                return;
+            }
+
             $variantInput = [
-                'productId' => $productGid,
-                'sku' => $product->sku,
+                'id' => $defaultVariant['id'],
                 'price' => (string) $price,
-                'barcode' => $product->barcode,  // Match REST: direct value, no null coalescing
-                'inventoryPolicy' => 'DENY', // Match REST default
-                'inventoryManagement' => 'SHOPIFY', // Match REST: 'shopify' -> 'SHOPIFY' (GraphQL format)
-                'taxable' => true, // Match REST default
-                'weight' => 0, // Match REST default
-                'weightUnit' => 'POUNDS', // Match REST default 'lb' -> 'POUNDS' (GraphQL format)
-                'requiresShipping' => true, // Match REST default
+                'barcode' => $product->barcode,
+                'inventoryPolicy' => 'DENY',
+                'taxable' => true,
+                'inventoryItem' => [
+                    'sku' => $product->sku,
+                    'tracked' => true,
+                    'requiresShipping' => true,
+                ],
             ];
 
             if ($compareAtPrice && $compareAtPrice != $price) {
@@ -180,38 +159,35 @@ class CreateProductGraphQL extends Command
             }
 
             $variantResponse = $this->graphqlService->mutate(
-                ProductMutations::createProductVariant(),
-                ['input' => $variantInput]
+                ProductMutations::bulkUpdateVariants(),
+                [
+                    'productId' => $productGid,
+                    'variants' => [$variantInput],
+                ]
             );
 
-            if (! isset($variantResponse['productVariantCreate']['productVariant'])) {
-                // Handle variant creation errors
-                $errors = [];
-                if (isset($variantResponse['productVariantCreate']['userErrors'])) {
-                    $errors = array_map(function ($error) {
-                        return $error['message'];
-                    }, $variantResponse['productVariantCreate']['userErrors']);
-                }
+            $updatedVariant = $variantResponse['productVariantsBulkUpdate']['product']['variants']['nodes'][0] ?? null;
 
-                $errorMessage = ! empty($errors) ? implode(', ', $errors) : 'Unknown error creating variant';
-                $this->error("Failed to create variant: {$errorMessage}");
-                Log::error("Error creating variant for {$product->sku}: {$errorMessage}");
-                $product->update(['uploaded_to_shopify' => 2]);
-
-                foreach ($product->children as $child) {
-                    $child->update(['uploaded_to_shopify' => 2]);
-                }
+            if (! $updatedVariant) {
+                $this->markCreateFailed($product, $variantResponse['productVariantsBulkUpdate']['userErrors'] ?? [], 'variant');
+                $this->deleteUpstreamProduct($productGid);
 
                 return;
             }
 
-            // Step 3: Save to database
-            $createdVariant = $variantResponse['productVariantCreate']['productVariant'];
-            $this->saveCreatedProductAndVariant($createdProduct, $createdVariant);
+            try {
+                $this->saveCreatedProductAndVariant($createdProduct, $updatedVariant);
+            } catch (QueryException $e) {
+                $this->error("Local DB write failed for SKU {$product->sku}: {$e->getMessage()}. Rolling back upstream product.");
+                Log::error("Local DB write failed for SKU {$product->sku}: ".$e->getMessage());
+                $this->deleteUpstreamProduct($productGid);
+                $product->update(['uploaded_to_shopify' => 2]);
+
+                return;
+            }
 
             $product->update(['uploaded_to_shopify' => 1]);
 
-            // Update children products as uploaded (matching REST logic)
             foreach ($product->children as $child) {
                 $child->update(['uploaded_to_shopify' => 1]);
             }
@@ -228,22 +204,68 @@ class CreateProductGraphQL extends Command
     }
 
     /**
-     * Save created product and variant to database (GraphQL approach)
+     * Look up an existing Shopify product by SKU and import its IDs into the
+     * local database. Returns true when a match is found and adopted.
+     * Exceptions propagate intentionally — swallowing a transport error here
+     * and falling through to productCreate would defeat the duplicate guard.
      */
-    protected function saveCreatedProductAndVariant(array $productData, array $variantData)
+    protected function adoptExistingShopifyProductBySku(RetailEdgeProduct $product): bool
     {
-        try {
-            DB::beginTransaction();
+        if (! $product->sku) {
+            return false;
+        }
 
-            // Extract REST IDs
+        $response = $this->graphqlService->query(
+            ProductQueries::findVariantBySku(),
+            ['query' => "sku:{$product->sku}"]
+        );
+
+        $variants = $response['productVariants']['nodes'] ?? [];
+
+        $match = collect($variants)->first(
+            fn ($variant) => isset($variant['sku']) && $variant['sku'] === $product->sku
+        );
+
+        if (! $match) {
+            return false;
+        }
+
+        $this->info("Found existing Shopify product for SKU {$product->sku}; adopting locally.");
+        Log::info("Adopting pre-existing Shopify product for SKU {$product->sku}");
+
+        $productData = $match['product'];
+        $variantData = $match;
+        unset($variantData['product']);
+
+        $this->saveCreatedProductAndVariant($productData, $variantData);
+
+        $product->update(['uploaded_to_shopify' => 1]);
+
+        foreach ($product->children as $child) {
+            $child->update(['uploaded_to_shopify' => 1]);
+        }
+
+        return true;
+    }
+
+    /**
+     * Persist product + variant in one transaction. The variant's
+     * inventory_item_id is written in the same row insert so we never have a
+     * window where the row exists without it.
+     */
+    protected function saveCreatedProductAndVariant(array $productData, array $variantData): void
+    {
+        DB::transaction(function () use ($productData, $variantData) {
             $productId = $this->graphqlService->extractRestId($productData['id']);
             $variantId = $this->graphqlService->extractRestId($variantData['id']);
 
-            // Create product
+            $sku = $variantData['inventoryItem']['sku'] ?? $variantData['sku'] ?? null;
+            $inventoryItemId = isset($variantData['inventoryItem']['id'])
+                ? $this->graphqlService->extractRestId($variantData['inventoryItem']['id'])
+                : null;
+
             $shopifyProduct = ShopifyProduct::updateOrCreate(
-                [
-                    'product_id' => $productId,
-                ],
+                ['product_id' => $productId],
                 [
                     'title' => $productData['title'],
                     'vendor' => $productData['vendor'] ?? null,
@@ -254,229 +276,116 @@ class CreateProductGraphQL extends Command
                 ]
             );
 
-            // Create variant (matching REST ShopifyService.saveProductToDb values)
-            $shopifyProductVariant = ShopifyProductVariant::create([
+            ShopifyProductVariant::create([
                 'shopify_product_id' => $shopifyProduct->id,
-                'sku' => $variantData['sku'], // From GraphQL response
+                'sku' => $sku,
                 'variant_id' => $variantId,
                 'product_id' => $productId,
-                'title' => $variantData['title'] ?? 'Default Title', // Shopify default
-                'price' => $variantData['price'],
-                'compare_at_price' => $variantData['compareAtPrice'] ? $variantData['compareAtPrice'] : 0,
-                'position' => 1, // Default position for first variant
-                'inventory_policy' => strtolower($variantData['inventoryPolicy'] ?? 'deny'), // Match REST format
-                'fulfillment_service' => 'manual', // Match REST default
-                'inventory_management' => strtolower($variantData['inventoryManagement'] ?? 'shopify'), // Match REST
-                'option1' => 'Default Title', // Shopify default for single variant products
+                'title' => $variantData['title'] ?? 'Default Title',
+                'price' => $variantData['price'] ?? 0,
+                'compare_at_price' => $variantData['compareAtPrice'] ?: 0,
+                'position' => 1,
+                'inventory_policy' => strtolower($variantData['inventoryPolicy'] ?? 'deny'),
+                'fulfillment_service' => 'manual',
+                'inventory_management' => 'shopify',
+                'option1' => 'Default Title',
                 'option2' => null,
                 'option3' => null,
-                'taxable' => $variantData['taxable'] ?? true, // Match REST default
-                'barcode' => $variantData['barcode'],
-                'grams' => $variantData['weight'] ?? 0, // In grams (match REST)
-                'weight' => $variantData['weight'] ? $variantData['weight'] / 453.592 : 0, // Convert grams to pounds (REST format)
-                'inventory_item_id' => null, // Will be populated by Shopify
-                'inventory_quantity' => 0, // Default
-                'old_inventory_quantity' => 0, // Default
-                'requires_shipping' => $variantData['requiresShipping'] ?? true, // Match REST default
-                'price_requires_update' => 1, // Match REST new variant flags
-                'inventory_requires_update' => 1, // Match REST new variant flags
-                'images_requires_update' => 1, // Match REST new variant flags
+                'taxable' => $variantData['taxable'] ?? true,
+                'barcode' => $variantData['barcode'] ?? null,
+                'grams' => 0,
+                'weight' => 0,
+                'inventory_item_id' => $inventoryItemId,
+                'inventory_quantity' => 0,
+                'old_inventory_quantity' => 0,
+                'requires_shipping' => $variantData['inventoryItem']['requiresShipping'] ?? true,
+                'price_requires_update' => 1,
+                'inventory_requires_update' => 1,
+                'images_requires_update' => 1,
             ]);
 
-            if ($shopifyProductVariant && $shopifyProductVariant->sku) {
-                \App\Models\EWeb\RetailEdgeProduct::where('sku', $shopifyProductVariant->sku)
-                    ->update(['uploaded_to_shopify' => 1]);
+            if ($sku) {
+                RetailEdgeProduct::where('sku', $sku)->update(['uploaded_to_shopify' => 1]);
             }
+        });
+    }
 
-            DB::commit();
-        } catch (\Exception $e) {
-            DB::rollBack();
-            throw $e;
+    /**
+     * Resolve (price, compareAtPrice) from the two retail-price columns.
+     * The lower price is the regular price; if the higher is meaningfully
+     * greater, it's the compare-at price.
+     */
+    private function resolvePrices(RetailEdgeProduct $product): array
+    {
+        $candidates = array_filter(
+            array_map('floatval', [$product->retail_price1, $product->retail_price2]),
+            fn ($p) => $p > 0
+        );
+
+        if (empty($candidates)) {
+            return [0, null];
+        }
+
+        $price = min($candidates);
+        $compareAtPrice = max($candidates);
+
+        return [$price, $price == $compareAtPrice ? null : $compareAtPrice];
+    }
+
+    private function markCreateFailed(RetailEdgeProduct $product, array $userErrors, string $stage): void
+    {
+        $messages = array_map(fn ($e) => $e['message'] ?? 'Unknown error', $userErrors);
+        $errorMessage = ! empty($messages) ? implode(', ', $messages) : "Unknown error creating $stage";
+
+        $this->error("Failed to create $stage for SKU {$product->sku}: {$errorMessage}");
+        Log::error("Error creating $stage for {$product->sku}: {$errorMessage}");
+
+        $product->update(['uploaded_to_shopify' => 2]);
+
+        foreach ($product->children as $child) {
+            $child->update(['uploaded_to_shopify' => 2]);
         }
     }
 
     /**
-     * Save created product to database - matching exact REST logic (LEGACY - not used in GraphQL)
+     * Best-effort delete of a Shopify product when local persistence fails.
+     * Logged on failure but never thrown — the local create has already
+     * decided this attempt is over.
      */
-    protected function saveCreatedProductToDb(array $productData)
+    private function deleteUpstreamProduct(string $productGid): void
     {
         try {
-            DB::beginTransaction();
-
-            // Extract REST product ID
-            $productId = $this->graphqlService->extractRestId($productData['id']);
-
-            // Process variants first (matching original REST logic)
-            if (isset($productData['variants']['nodes'])) {
-                foreach ($productData['variants']['nodes'] as $variantData) {
-                    $variantId = $this->graphqlService->extractRestId($variantData['id']);
-
-                    if ($shopifyProductVariant = ShopifyProductVariant::where('variant_id', $variantId)->first()) {
-                        // Update existing variant case (matching REST)
-                        $shopifyProduct = ShopifyProduct::updateOrCreate(
-                            [
-                                'product_id' => $productId,
-                            ],
-                            [
-                                'title' => $productData['title'],
-                                'vendor' => $productData['vendor'] ?? null,
-                                'product_type' => $productData['productType'] ?? null,
-                                'handle' => $productData['handle'],
-                                'tags' => implode(',', $productData['tags'] ?? []),
-                                'status' => strtolower($productData['status']),
-                            ]
-                        );
-
-                        $this->updateExistingVariant($shopifyProductVariant, $variantData, $productId);
-                    } else {
-                        // Create new variant case (matching REST)
-                        $shopifyProduct = ShopifyProduct::updateOrCreate(
-                            [
-                                'product_id' => $productId,
-                            ],
-                            [
-                                'title' => $productData['title'],
-                                'vendor' => $productData['vendor'] ?? null,
-                                'product_type' => $productData['productType'] ?? null,
-                                'handle' => $productData['handle'],
-                                'tags' => implode(',', $productData['tags'] ?? []),
-                                'status' => strtolower($productData['status']),
-                            ]
-                        );
-
-                        $this->createNewVariant($shopifyProduct, $variantData, $productId);
-                    }
-                }
-            }
-
-            DB::commit();
+            $this->graphqlService->mutate(
+                ProductMutations::deleteProduct(),
+                ['input' => ['id' => $productGid]]
+            );
+            Log::info("Rolled back upstream product $productGid after local failure.");
         } catch (\Exception $e) {
-            DB::rollBack();
-            throw $e;
+            Log::error("Failed to roll back upstream product $productGid: ".$e->getMessage());
         }
     }
 
-    /**
-     * Update existing variant (matching REST logic)
-     */
-    protected function updateExistingVariant($shopifyProductVariant, array $variantData, string $productId)
-    {
-        $option1 = $option2 = $option3 = null;
-        if (isset($variantData['selectedOptions'])) {
-            foreach ($variantData['selectedOptions'] as $index => $option) {
-                ${'option'.($index + 1)} = $option['value'] ?? null;
-            }
-        }
-
-        $inventoryItemId = isset($variantData['inventoryItem']['id']) ?
-            $this->graphqlService->extractRestId($variantData['inventoryItem']['id']) : null;
-
-        $shopifyProductVariant->update([
-            'product_id' => $productId,
-            'title' => $variantData['title'],
-            'price' => $variantData['price'] ?? 0,
-            'position' => $variantData['position'] ?? 1,
-            'inventory_policy' => strtolower($variantData['inventoryPolicy'] ?? 'deny'),
-            'fulfillment_service' => $variantData['fulfillmentService'] ?? 'manual',
-            'inventory_management' => $variantData['inventoryManagement'] ?? null,
-            'option1' => $option1,
-            'option2' => $option2,
-            'option3' => $option3,
-            'taxable' => $variantData['taxable'] ?? true,
-            'barcode' => $variantData['barcode'] ?? null,
-            'grams' => isset($variantData['weight']) ? $variantData['weight'] * 1000 : 0,
-            'weight' => $variantData['weight'] ?? 0,
-            'inventory_item_id' => $inventoryItemId,
-            'inventory_quantity' => $variantData['inventoryQuantity'] ?? 0,
-            'old_inventory_quantity' => $variantData['oldInventoryQuantity'] ?? 0,
-            'requires_shipping' => $variantData['requiresShipping'] ?? true,
-        ]);
-
-        if ($shopifyProductVariant && $shopifyProductVariant->sku) {
-            \App\Models\EWeb\RetailEdgeProduct::where('sku', $shopifyProductVariant->sku)
-                ->update(['uploaded_to_shopify' => 1]);
-        }
-    }
-
-    /**
-     * Create new variant (matching REST logic)
-     */
-    protected function createNewVariant($shopifyProduct, array $variantData, string $productId)
-    {
-        $variantId = $this->graphqlService->extractRestId($variantData['id']);
-
-        $option1 = $option2 = $option3 = null;
-        if (isset($variantData['selectedOptions'])) {
-            foreach ($variantData['selectedOptions'] as $index => $option) {
-                ${'option'.($index + 1)} = $option['value'] ?? null;
-            }
-        }
-
-        $inventoryItemId = isset($variantData['inventoryItem']['id']) ?
-            $this->graphqlService->extractRestId($variantData['inventoryItem']['id']) : null;
-
-        $shopifyProductVariant = ShopifyProductVariant::create([
-            'shopify_product_id' => $shopifyProduct->id,
-            'sku' => $variantData['sku'] ?? null,
-            'variant_id' => $variantId,
-            'product_id' => $productId,
-            'title' => $variantData['title'],
-            'price' => $variantData['price'] ?? 0,
-            'compare_at_price' => $variantData['compareAtPrice'] ? $variantData['compareAtPrice'] : 0,
-            'position' => $variantData['position'] ?? 1,
-            'inventory_policy' => strtolower($variantData['inventoryPolicy'] ?? 'deny'),
-            'fulfillment_service' => $variantData['fulfillmentService'] ?? 'manual',
-            'inventory_management' => $variantData['inventoryManagement'] ?? null,
-            'option1' => $option1,
-            'option2' => $option2,
-            'option3' => $option3,
-            'taxable' => $variantData['taxable'] ?? true,
-            'barcode' => $variantData['barcode'] ?? null,
-            'grams' => isset($variantData['weight']) ? $variantData['weight'] * 1000 : 0,
-            'weight' => $variantData['weight'] ?? 0,
-            'inventory_item_id' => $inventoryItemId,
-            'inventory_quantity' => $variantData['inventoryQuantity'] ?? 0,
-            'old_inventory_quantity' => isset($variantData['oldInventoryQuantity']) ? $variantData['oldInventoryQuantity'] : 0,
-            'requires_shipping' => $variantData['requiresShipping'] ?? true,
-            'price_requires_update' => 1,
-            'inventory_requires_update' => 1,
-            'images_requires_update' => 1,
-        ]);
-
-        if ($shopifyProductVariant && $shopifyProductVariant->sku) {
-            \App\Models\EWeb\RetailEdgeProduct::where('sku', $shopifyProductVariant->sku)
-                ->update(['uploaded_to_shopify' => 1]);
-        }
-    }
-
-    /**
-     * Calculate tags for the product
-     */
     private function calculateTags(RetailEdgeProduct $product): array
     {
+        $types = [
+            's_web_menu' => 'S.WebMenu',
+            's_metal_type' => 'S.Metal Type',
+            's_stone_type' => 'S.Stone Type',
+            's_cat' => 'S.Cat',
+            's_sub_cat' => 'S.Sub Cat',
+        ];
+
         $tags = [];
 
-        try {
-            $types = [
-                's_web_menu' => 'S.WebMenu',
-                's_metal_type' => 'S.Metal Type',
-                's_stone_type' => 'S.Stone Type',
-                's_cat' => 'S.Cat',
-                's_sub_cat' => 'S.Sub Cat',
-            ];
-
-            foreach ($types as $type => $value) {
-                $propValue = $product->{$type} ?? '';
-                if ($propValue !== '' && $propValue !== 'N/A') {
-                    foreach (explode(',', $propValue) as $tempTag) {
-                        $tags[] = $value.'_'.trim($tempTag);
-                    }
-                }
+        foreach ($types as $property => $prefix) {
+            $value = $product->{$property} ?? '';
+            if ($value === '' || $value === 'N/A') {
+                continue;
             }
-        } catch (\Exception $e) {
-            report($e);
 
-            return [];
+            foreach (explode(',', $value) as $part) {
+                $tags[] = $prefix.'_'.trim($part);
+            }
         }
 
         return $tags;

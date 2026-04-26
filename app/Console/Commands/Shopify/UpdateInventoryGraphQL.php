@@ -37,33 +37,32 @@ class UpdateInventoryGraphQL extends Command
         $marketplace = 'Shopify';
         $jobType = 'shopifyUpdateInventoryGraphQL';
 
-        $job = (new SyncJobService)->getJob($jobType, $marketplace);
+        $job = (new SyncJobService)->claim($jobType, $marketplace);
 
-        if (! $job->isRunning()) {
-            try {
-                Log::info("$marketplace $jobType started!");
-                $job->update(['status' => 1]);
-
-                $this->graphqlService = new ShopifyGraphQLService;
-
-                $location = ShopifyLocation::first();
-                if (! $location) {
-                    throw new \Exception('No Shopify location found. Please run shopify:get-products-graphql first.');
-                }
-
-                // Process inventory updates in batches
-                $this->processInventoryUpdates($location);
-
-                $job->update(['status' => 0, 'message' => null]);
-                Log::info("$marketplace $jobType finished!");
-
-            } catch (\Exception $e) {
-                $job->update(['status' => 0, 'message' => $e->getMessage()]);
-                report($e);
-                $this->error($e->getMessage());
-            }
-        } else {
+        if (! $job) {
             Log::info("$marketplace $jobType is already running.");
+
+            return;
+        }
+
+        try {
+            Log::info("$marketplace $jobType started!");
+
+            $this->graphqlService = new ShopifyGraphQLService;
+
+            $location = ShopifyLocation::first();
+            if (! $location) {
+                throw new \Exception('No Shopify location found. Please run shopify:get-products-graphql first.');
+            }
+
+            $this->processInventoryUpdates($location);
+
+            $job->update(['status' => 0, 'message' => null]);
+            Log::info("$marketplace $jobType finished!");
+        } catch (\Exception $e) {
+            $job->update(['status' => 0, 'message' => $e->getMessage()]);
+            report($e);
+            $this->error($e->getMessage());
         }
     }
 
@@ -140,20 +139,36 @@ class UpdateInventoryGraphQL extends Command
     }
 
     /**
-     * Update inventory in batch using GraphQL
+     * Update inventory in batch using GraphQL.
+     *
+     * - `name` must be a real Shopify inventory state ("available" or
+     *   "on_hand"), not a free-form description.
+     * - `ignoreCompareQuantity: true` opts out of compare-and-set because
+     *   RetailEdge is the source of truth and we don't track persisted
+     *   quantity locally.
+     * - The `@idempotent` key is derived from the batch contents so a
+     *   retry of the same batch is deduplicated by Shopify; a random key
+     *   would defeat that and risk double-applying the change.
      */
     protected function updateInventoryBatch(array $quantities, array $variantMap)
     {
         try {
+            $referenceDocumentUri = 'retailedge://burrows/inventory-sync/'.now()->toIso8601String();
+
             $input = [
                 'reason' => 'correction',
-                'name' => 'Inventory sync from RetailEdge',
+                'name' => 'available',
+                'ignoreCompareQuantity' => true,
+                'referenceDocumentUri' => $referenceDocumentUri,
                 'quantities' => $quantities,
             ];
 
             $response = $this->graphqlService->mutate(
                 ProductMutations::setInventoryQuantities(),
-                ['input' => $input]
+                [
+                    'input' => $input,
+                    'idempotencyKey' => $this->buildIdempotencyKey($quantities),
+                ]
             );
 
             if (isset($response['inventorySetQuantities']['inventoryAdjustmentGroup'])) {
@@ -205,21 +220,29 @@ class UpdateInventoryGraphQL extends Command
     }
 
     /**
-     * Activate an archived product
+     * Build a deterministic idempotency key for a batch. Same set of
+     * (item, location, quantity) tuples → same key, so retries of the
+     * same logical batch are de-duplicated upstream.
+     */
+    private function buildIdempotencyKey(array $quantities): string
+    {
+        $payload = $quantities;
+        sort($payload);
+
+        return hash('sha256', json_encode($payload));
+    }
+
+    /**
+     * Activate an archived product. Uses ProductUpdateInput (`product:`).
      */
     protected function activateProduct(ShopifyProduct $product)
     {
         try {
             $productGid = $this->graphqlService->formatGraphQLId('Product', $product->product_id);
 
-            $input = [
-                'id' => $productGid,
-                'status' => 'ACTIVE', // GraphQL enum value (REST uses 'active' but GraphQL uses 'ACTIVE')
-            ];
-
             $response = $this->graphqlService->mutate(
                 ProductMutations::updateProductStatus(),
-                ['input' => $input]
+                ['product' => ['id' => $productGid, 'status' => 'ACTIVE']]
             );
 
             if (isset($response['productUpdate']['product'])) {

@@ -5,7 +5,10 @@ namespace App\Services\GraphQL;
 class ProductQueries
 {
     /**
-     * Query to fetch products with variants and inventory
+     * Walk every product with the variants needed by GetProductsGraphQL.
+     * From API 2024-04 onwards: sku, requiresShipping and weight all live on
+     * inventoryItem; inventoryManagement and fulfillmentService have been
+     * removed. inventoryQuantity is still on the variant directly.
      */
     public static function getProducts(): string
     {
@@ -29,29 +32,36 @@ class ProductQueries
                     variants(first: 100) {
                         nodes {
                             id
-                            sku
                             title
                             price
                             compareAtPrice
                             position
                             inventoryPolicy
-                            fulfillmentService
-                            inventoryManagement
                             selectedOptions {
                                 name
                                 value
                             }
                             taxable
                             barcode
-                            weight
-                            weightUnit
-                            requiresShipping
+                            inventoryQuantity
                             inventoryItem {
                                 id
+                                sku
+                                tracked
+                                requiresShipping
+                                measurement {
+                                    weight {
+                                        value
+                                        unit
+                                    }
+                                }
                                 inventoryLevels(first: 10) {
                                     nodes {
                                         id
-                                        available
+                                        quantities(names: ["available"]) {
+                                            name
+                                            quantity
+                                        }
                                         location {
                                             id
                                             name
@@ -69,69 +79,28 @@ class ProductQueries
     }
 
     /**
-     * Query to fetch a single product by ID
+     * Lighter product walk used by the dedupe command.
      */
-    public static function getProductById(): string
+    public static function getProductsForDedupe(): string
     {
         return <<<'GRAPHQL'
-        query getProduct($id: ID!) {
-            product(id: $id) {
-                id
-                title
-                handle
-                vendor
-                productType
-                status
-                tags
-                createdAt
-                updatedAt
-                variants(first: 100) {
-                    nodes {
-                        id
-                        sku
-                        title
-                        price
-                        compareAtPrice
-                        position
-                        inventoryPolicy
-                        fulfillmentService
-                        inventoryManagement
-                        selectedOptions {
-                            name
-                            value
-                        }
-                        taxable
-                        barcode
-                        weight
-                        weightUnit
-                        requiresShipping
-                        inventoryItem {
-                            id
-                        }
-                    }
-                }
-            }
-        }
-        GRAPHQL;
-    }
-
-    /**
-     * Query to search products by SKU
-     */
-    public static function searchProductsBySku(): string
-    {
-        return <<<'GRAPHQL'
-        query searchProductsBySku($query: String!, $first: Int!) {
-            products(first: $first, query: $query) {
+        query getProductsForDedupe($first: Int!, $after: String) {
+            products(first: $first, after: $after) {
+                pageInfo { hasNextPage endCursor }
                 nodes {
                     id
                     title
+                    createdAt
+                    status
+                    totalInventory
+                    media(first: 1) {
+                        nodes { id }
+                    }
                     variants(first: 100) {
                         nodes {
                             id
-                            sku
                             inventoryItem {
-                                id
+                                sku
                             }
                         }
                     }
@@ -142,8 +111,43 @@ class ProductQueries
     }
 
     /**
-     * Query to fetch locations
+     * Find a single variant (and its parent product) by exact SKU.
      */
+    public static function findVariantBySku(): string
+    {
+        return <<<'GRAPHQL'
+        query findVariantBySku($query: String!) {
+            productVariants(first: 5, query: $query) {
+                nodes {
+                    id
+                    title
+                    price
+                    compareAtPrice
+                    barcode
+                    taxable
+                    inventoryPolicy
+                    sku
+                    inventoryItem {
+                        id
+                        sku
+                        tracked
+                        requiresShipping
+                    }
+                    product {
+                        id
+                        title
+                        handle
+                        vendor
+                        productType
+                        status
+                        tags
+                    }
+                }
+            }
+        }
+        GRAPHQL;
+    }
+
     public static function getLocations(): string
     {
         return <<<'GRAPHQL'
@@ -165,42 +169,6 @@ class ProductQueries
                     }
                     isActive
                     fulfillsOnlineOrders
-                }
-            }
-        }
-        GRAPHQL;
-    }
-
-    /**
-     * Query to fetch inventory levels for a location
-     */
-    public static function getInventoryLevels(): string
-    {
-        return <<<'GRAPHQL'
-        query getInventoryLevels($locationId: ID!, $first: Int!, $after: String) {
-            location(id: $locationId) {
-                id
-                inventoryLevels(first: $first, after: $after) {
-                    pageInfo {
-                        hasNextPage
-                        endCursor
-                    }
-                    nodes {
-                        id
-                        available
-                        item {
-                            id
-                            sku
-                            variant {
-                                id
-                                sku
-                                product {
-                                    id
-                                }
-                            }
-                        }
-                        updatedAt
-                    }
                 }
             }
         }

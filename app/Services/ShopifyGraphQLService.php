@@ -201,11 +201,13 @@ class ShopifyGraphQLService extends ShopifyConnectionService
     }
 
     /**
-     * Extract REST ID from GraphQL ID
+     * Extract REST ID from GraphQL ID. Anchored so a string with junk on
+     * either side (e.g. an injected GID embedded in a free-form value) does
+     * not match.
      */
     public function extractRestId(string $graphqlId): ?string
     {
-        if (preg_match('/gid:\/\/shopify\/\w+\/(\d+)/', $graphqlId, $matches)) {
+        if (preg_match('#^gid://shopify/\w+/(\d+)$#', $graphqlId, $matches)) {
             return $matches[1];
         }
 

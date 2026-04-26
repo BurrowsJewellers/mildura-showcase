@@ -40,31 +40,28 @@ class GetProductsGraphQL extends Command
         $marketplace = 'Shopify';
         $jobType = 'shopifyGetProductsGraphQL';
 
-        $job = (new SyncJobService)->getJob($jobType, $marketplace);
+        $job = (new SyncJobService)->claim($jobType, $marketplace);
 
-        if (! $job->isRunning()) {
-            try {
-                Log::info("$marketplace $jobType started!");
-                $job->update(['status' => 1]);
-
-                $this->graphqlService = new ShopifyGraphQLService;
-
-                // Get Shopify locations
-                $this->getLocations();
-
-                // Get Shopify products with inventory
-                $this->getProducts();
-
-                $job->update(['status' => 0, 'message' => null]);
-
-                Log::info("$marketplace $jobType finished!");
-            } catch (\Exception $e) {
-                $job->update(['status' => 0, 'message' => $e->getMessage()]);
-                report($e);
-                $this->error($e->getMessage());
-            }
-        } else {
+        if (! $job) {
             Log::info("$marketplace $jobType is already running.");
+
+            return;
+        }
+
+        try {
+            Log::info("$marketplace $jobType started!");
+
+            $this->graphqlService = new ShopifyGraphQLService;
+
+            $this->getLocations();
+            $this->getProducts();
+
+            $job->update(['status' => 0, 'message' => null]);
+            Log::info("$marketplace $jobType finished!");
+        } catch (\Exception $e) {
+            $job->update(['status' => 0, 'message' => $e->getMessage()]);
+            report($e);
+            $this->error($e->getMessage());
         }
     }
 
@@ -199,122 +196,144 @@ class GetProductsGraphQL extends Command
     }
 
     /**
-     * Save variant data to database
+     * Save variant data to database. Reads sku, requiresShipping, weight,
+     * tracked from the inventoryItem subtree — those fields were moved off
+     * ProductVariant in API 2024-04 and removed from the variant in 2026-04.
      */
     protected function saveVariantToDb(ShopifyProduct $shopifyProduct, array $variantData, string $productId)
     {
-        // Extract REST variant ID
         $variantId = $this->graphqlService->extractRestId($variantData['id']);
 
-        // Build options from selectedOptions
-        $option1 = null;
-        $option2 = null;
-        $option3 = null;
-
-        if (isset($variantData['selectedOptions'])) {
-            foreach ($variantData['selectedOptions'] as $index => $option) {
-                $optionValue = $option['value'];
-                switch ($index) {
-                    case 0:
-                        $option1 = $optionValue;
-                        break;
-                    case 1:
-                        $option2 = $optionValue;
-                        break;
-                    case 2:
-                        $option3 = $optionValue;
-                        break;
-                }
+        $options = [null, null, null];
+        foreach (($variantData['selectedOptions'] ?? []) as $index => $option) {
+            if ($index < 3) {
+                $options[$index] = $option['value'] ?? null;
             }
         }
+        [$option1, $option2, $option3] = $options;
 
-        // Extract inventory item ID
-        $inventoryItemId = null;
-        if (isset($variantData['inventoryItem']['id'])) {
-            $inventoryItemId = $this->graphqlService->extractRestId($variantData['inventoryItem']['id']);
-        }
+        $inventoryItem = $variantData['inventoryItem'] ?? [];
+        $inventoryItemId = isset($inventoryItem['id'])
+            ? $this->graphqlService->extractRestId($inventoryItem['id'])
+            : null;
+        $sku = $inventoryItem['sku'] ?? null;
+        $requiresShipping = $inventoryItem['requiresShipping'] ?? true;
 
-        // Get inventory quantity from first location
-        $inventoryQuantity = 0;
-        if (isset($variantData['inventoryItem']['inventoryLevels']['nodes'][0])) {
-            $inventoryLevel = $variantData['inventoryItem']['inventoryLevels']['nodes'][0];
-            $inventoryQuantity = $inventoryLevel['available'] ?? 0;
+        $weightValue = $inventoryItem['measurement']['weight']['value'] ?? null;
+        $weightUnit = $inventoryItem['measurement']['weight']['unit'] ?? null;
+        $weightInKg = $this->normalizeWeightToKg($weightValue, $weightUnit);
 
-            // Save inventory level
-            if ($inventoryItemId && isset($inventoryLevel['location']['id'])) {
-                $locationId = $this->graphqlService->extractRestId($inventoryLevel['location']['id']);
-                ShopifyInventoryLevel::updateOrCreate(
-                    [
-                        'location_id' => $locationId,
-                        'inventory_item_id' => $inventoryItemId,
-                    ],
-                    [
-                        'available' => $inventoryQuantity,
-                        'inventory_updated_at' => Carbon::parse($inventoryLevel['updatedAt'] ?? now()),
-                    ]
-                );
+        $inventoryQuantity = $variantData['inventoryQuantity'] ?? 0;
+
+        foreach (($inventoryItem['inventoryLevels']['nodes'] ?? []) as $inventoryLevel) {
+            if (! $inventoryItemId || ! isset($inventoryLevel['location']['id'])) {
+                continue;
             }
+
+            $locationId = $this->graphqlService->extractRestId($inventoryLevel['location']['id']);
+            $available = $this->extractAvailableQuantity($inventoryLevel);
+
+            ShopifyInventoryLevel::updateOrCreate(
+                [
+                    'location_id' => $locationId,
+                    'inventory_item_id' => $inventoryItemId,
+                ],
+                [
+                    'available' => $available,
+                    'inventory_updated_at' => Carbon::parse($inventoryLevel['updatedAt'] ?? now()),
+                ]
+            );
         }
 
-        // Check if variant exists (matching original REST logic)
         if ($shopifyProductVariant = ShopifyProductVariant::where('variant_id', $variantId)->first()) {
-            // Update existing variant
             $shopifyProductVariant->update([
                 'product_id' => $productId,
                 'title' => $variantData['title'],
                 'price' => $variantData['price'] ?? 0,
                 'position' => $variantData['position'] ?? 1,
                 'inventory_policy' => strtolower($variantData['inventoryPolicy'] ?? 'deny'),
-                'fulfillment_service' => $variantData['fulfillmentService'] ?? 'manual',
-                'inventory_management' => $variantData['inventoryManagement'] ?? null,
+                'fulfillment_service' => 'manual',
+                'inventory_management' => 'shopify',
                 'option1' => $option1,
                 'option2' => $option2,
                 'option3' => $option3,
                 'taxable' => $variantData['taxable'] ?? true,
                 'barcode' => $variantData['barcode'] ?? null,
-                'grams' => isset($variantData['weight']) ? $variantData['weight'] * 1000 : 0,
-                'weight' => $variantData['weight'] ?? 0,
+                'grams' => $weightInKg ? (int) round($weightInKg * 1000) : 0,
+                'weight' => $weightInKg ?? 0,
                 'inventory_item_id' => $inventoryItemId,
                 'inventory_quantity' => $inventoryQuantity,
                 'old_inventory_quantity' => $inventoryQuantity,
-                'requires_shipping' => $variantData['requiresShipping'] ?? true,
+                'requires_shipping' => $requiresShipping,
             ]);
         } else {
-            // Create new variant - matching original REST logic
             $shopifyProductVariant = ShopifyProductVariant::create([
                 'shopify_product_id' => $shopifyProduct->id,
-                'sku' => $variantData['sku'] ?? null,
+                'sku' => $sku,
                 'variant_id' => $variantId,
                 'product_id' => $productId,
                 'title' => $variantData['title'],
                 'price' => $variantData['price'] ?? 0,
-                'compare_at_price' => $variantData['compareAtPrice'] ? $variantData['compareAtPrice'] : 0,
+                'compare_at_price' => $variantData['compareAtPrice'] ?: 0,
                 'position' => $variantData['position'] ?? 1,
                 'inventory_policy' => strtolower($variantData['inventoryPolicy'] ?? 'deny'),
-                'fulfillment_service' => $variantData['fulfillmentService'] ?? 'manual',
-                'inventory_management' => $variantData['inventoryManagement'] ?? null,
+                'fulfillment_service' => 'manual',
+                'inventory_management' => 'shopify',
                 'option1' => $option1,
                 'option2' => $option2,
                 'option3' => $option3,
                 'taxable' => $variantData['taxable'] ?? true,
                 'barcode' => $variantData['barcode'] ?? null,
-                'grams' => isset($variantData['weight']) ? $variantData['weight'] * 1000 : 0,
-                'weight' => $variantData['weight'] ?? 0,
+                'grams' => $weightInKg ? (int) round($weightInKg * 1000) : 0,
+                'weight' => $weightInKg ?? 0,
                 'inventory_item_id' => $inventoryItemId,
                 'inventory_quantity' => $inventoryQuantity,
-                'old_inventory_quantity' => isset($variantData['old_inventory_quantity']) ? $variantData['old_inventory_quantity'] : 0,
-                'requires_shipping' => $variantData['requiresShipping'] ?? true,
+                'old_inventory_quantity' => 0,
+                'requires_shipping' => $requiresShipping,
                 'price_requires_update' => 1,
                 'inventory_requires_update' => 1,
                 'images_requires_update' => 1,
             ]);
         }
 
-        // Mark as uploaded in RetailEdge products
         if ($shopifyProductVariant && $shopifyProductVariant->sku) {
             \App\Models\EWeb\RetailEdgeProduct::where('sku', $shopifyProductVariant->sku)
                 ->update(['uploaded_to_shopify' => 1]);
         }
+    }
+
+    /**
+     * Read the available quantity from a Shopify inventoryLevel node.
+     * The 2024-10+ shape returns quantities[] with name/quantity pairs.
+     */
+    private function extractAvailableQuantity(array $inventoryLevel): int
+    {
+        foreach (($inventoryLevel['quantities'] ?? []) as $entry) {
+            if (($entry['name'] ?? null) === 'available') {
+                return (int) ($entry['quantity'] ?? 0);
+            }
+        }
+
+        return 0;
+    }
+
+    /**
+     * Convert a Shopify Weight (value + WeightUnit enum) to kilograms.
+     * Shopify returns one of: GRAMS, KILOGRAMS, OUNCES, POUNDS.
+     */
+    private function normalizeWeightToKg(?float $value, ?string $unit): ?float
+    {
+        if ($value === null || $unit === null) {
+            return null;
+        }
+
+        return match ($unit) {
+            'GRAMS' => $value / 1000,
+            'KILOGRAMS' => $value,
+            'OUNCES' => $value * 0.0283495,
+            'POUNDS' => $value * 0.453592,
+            default => $value,
+        };
     }
 
     /**

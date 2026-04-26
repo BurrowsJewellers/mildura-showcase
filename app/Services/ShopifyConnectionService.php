@@ -2,13 +2,18 @@
 
 namespace App\Services;
 
-use Shopify\ApiVersion;
+use Shopify\Auth\FileSessionStorage;
 use Shopify\Auth\Session;
 use Shopify\Context;
-use Shopify\Auth\FileSessionStorage;
 
 class ShopifyConnectionService
 {
+    /**
+     * Pinned Shopify Admin API version. Bump intentionally on the quarterly
+     * release schedule rather than tracking "LATEST". 2026-04 introduces a
+     * mandatory @idempotent directive on inventorySetQuantities.
+     */
+    private const API_VERSION = '2026-04';
 
     public function getSession(): Session
     {
@@ -18,7 +23,7 @@ class ShopifyConnectionService
             scopes: ['NA'],
             hostName: config('shopify.store_name'),
             sessionStorage: new FileSessionStorage(storage_path()),
-            apiVersion: ApiVersion::LATEST,
+            apiVersion: self::API_VERSION,
             isEmbeddedApp: false,
         );
 

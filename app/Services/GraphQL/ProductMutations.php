@@ -5,13 +5,16 @@ namespace App\Services\GraphQL;
 class ProductMutations
 {
     /**
-     * Mutation to create a product
+     * Create a product. Uses ProductCreateInput (the non-deprecated input
+     * type). productCreate auto-creates a single default variant with no SKU;
+     * its ID is returned so the caller can populate it via
+     * productVariantsBulkUpdate.
      */
     public static function createProduct(): string
     {
         return <<<'GRAPHQL'
-        mutation createProduct($input: ProductInput!) {
-            productCreate(input: $input) {
+        mutation createProduct($product: ProductCreateInput!) {
+            productCreate(product: $product) {
                 product {
                     id
                     title
@@ -20,26 +23,9 @@ class ProductMutations
                     productType
                     status
                     tags
-                    variants(first: 100) {
+                    variants(first: 1) {
                         nodes {
                             id
-                            sku
-                            title
-                            price
-                            compareAtPrice
-                            position
-                            inventoryPolicy
-                            fulfillmentService
-                            inventoryManagement
-                            selectedOptions {
-                                name
-                                value
-                            }
-                            taxable
-                            barcode
-                            weight
-                            weightUnit
-                            requiresShipping
                             inventoryItem {
                                 id
                             }
@@ -56,13 +42,13 @@ class ProductMutations
     }
 
     /**
-     * Mutation to update a product
+     * Update a product (tags, status, etc.) using ProductUpdateInput.
      */
     public static function updateProduct(): string
     {
         return <<<'GRAPHQL'
-        mutation updateProduct($input: ProductInput!) {
-            productUpdate(input: $input) {
+        mutation updateProduct($product: ProductUpdateInput!) {
+            productUpdate(product: $product) {
                 product {
                     id
                     title
@@ -79,7 +65,19 @@ class ProductMutations
     }
 
     /**
-     * Mutation to update product variants in bulk
+     * Update product status only — same payload as updateProduct, kept as a
+     * separate method for readability at call sites that toggle ARCHIVED /
+     * ACTIVE.
+     */
+    public static function updateProductStatus(): string
+    {
+        return self::updateProduct();
+    }
+
+    /**
+     * Bulk-update variants. SKU lives on inventoryItem from API 2024-04
+     * onwards; weight, requiresShipping and tracked all live on inventoryItem
+     * too.
      */
     public static function bulkUpdateVariants(): string
     {
@@ -94,6 +92,21 @@ class ProductMutations
                             sku
                             price
                             compareAtPrice
+                            barcode
+                            inventoryPolicy
+                            taxable
+                            inventoryItem {
+                                id
+                                sku
+                                tracked
+                                requiresShipping
+                                measurement {
+                                    weight {
+                                        value
+                                        unit
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -107,16 +120,21 @@ class ProductMutations
     }
 
     /**
-     * Mutation to update inventory quantities
+     * inventorySetQuantities — required @idempotent directive from API
+     * 2026-04. The mutation expects a state name ("available" or "on_hand")
+     * and either a compareQuantity per item or ignoreCompareQuantity:true at
+     * the top level. We pass ignoreCompareQuantity because RetailEdge is the
+     * source of truth — concurrent writes are not expected.
      */
     public static function setInventoryQuantities(): string
     {
         return <<<'GRAPHQL'
-        mutation inventorySetQuantities($input: InventorySetQuantitiesInput!) {
-            inventorySetQuantities(input: $input) {
+        mutation inventorySetQuantities($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
+            inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
                 inventoryAdjustmentGroup {
                     id
                     reason
+                    referenceDocumentUri
                     changes {
                         name
                         delta
@@ -124,6 +142,7 @@ class ProductMutations
                     }
                 }
                 userErrors {
+                    code
                     field
                     message
                 }
@@ -133,7 +152,8 @@ class ProductMutations
     }
 
     /**
-     * Mutation to create product media (images)
+     * Add media to a product. The mutation name productCreateMedia is
+     * unchanged; the input type is CreateMediaInput.
      */
     public static function createProductMedia(): string
     {
@@ -164,14 +184,14 @@ class ProductMutations
     }
 
     /**
-     * Mutation to update variant media
+     * Append media references to a variant.
      */
     public static function updateVariantMedia(): string
     {
         return <<<'GRAPHQL'
-        mutation productVariantAppendMedia($id: ID!, $mediaIds: [ID!]!) {
-            productVariantAppendMedia(id: $id, mediaIds: $mediaIds) {
-                productVariant {
+        mutation productVariantAppendMedia($productId: ID!, $variantMedia: [ProductVariantAppendMediaInput!]!) {
+            productVariantAppendMedia(productId: $productId, variantMedia: $variantMedia) {
+                productVariants {
                     id
                     media(first: 10) {
                         nodes {
@@ -189,47 +209,15 @@ class ProductMutations
     }
 
     /**
-     * Mutation to archive/activate a product
+     * Permanently delete a product. Used as a rollback when the upstream
+     * create succeeded but the local DB write failed.
      */
-    public static function updateProductStatus(): string
+    public static function deleteProduct(): string
     {
         return <<<'GRAPHQL'
-        mutation updateProductStatus($input: ProductInput!) {
-            productUpdate(input: $input) {
-                product {
-                    id
-                    title
-                    status
-                }
-                userErrors {
-                    field
-                    message
-                }
-            }
-        }
-        GRAPHQL;
-    }
-
-    /**
-     * Mutation to create a product variant
-     */
-    public static function createProductVariant(): string
-    {
-        return <<<'GRAPHQL'
-        mutation productVariantCreate($input: ProductVariantInput!) {
-            productVariantCreate(input: $input) {
-                productVariant {
-                    id
-                    sku
-                    price
-                    compareAtPrice
-                    barcode
-                    inventoryPolicy
-                    inventoryQuantity
-                    taxable
-                    weight
-                    weightUnit
-                }
+        mutation productDelete($input: ProductDeleteInput!) {
+            productDelete(input: $input) {
+                deletedProductId
                 userErrors {
                     field
                     message
