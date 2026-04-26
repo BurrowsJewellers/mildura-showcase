@@ -142,16 +142,20 @@ class ShopifyGraphQLService extends ShopifyConnectionService
             } elseif (isset($connection['edges'])) {
                 foreach ($connection['edges'] as $edge) {
                     $callback($edge['node']);
-                    $cursor = $edge['cursor'] ?? null;
                 }
             }
 
-            // Check for next page
+            // Advance cursor from pageInfo. Trusting endCursor on every page
+            // (rather than only when $cursor is empty) is what keeps long
+            // walks moving — the prior `! $cursor` guard pinned the cursor
+            // to page 1 and made every subsequent loop refetch page 2.
             $pageInfo = $connection['pageInfo'] ?? null;
             $hasNextPage = $pageInfo['hasNextPage'] ?? false;
+            $cursor = $hasNextPage ? ($pageInfo['endCursor'] ?? null) : null;
 
-            if ($hasNextPage && ! $cursor && isset($pageInfo['endCursor'])) {
-                $cursor = $pageInfo['endCursor'];
+            if ($hasNextPage && ! $cursor) {
+                Log::warning("Pagination stopped: hasNextPage true but no endCursor for '$connectionPath'");
+                break;
             }
 
             // Rate limit protection
