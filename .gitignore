@@ -20,3 +20,5 @@ yarn-error.log
 /.vscode
 /.zed
 conf.txt
+CLAUDE.md
+/.claude
