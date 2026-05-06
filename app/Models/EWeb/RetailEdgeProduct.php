@@ -55,7 +55,11 @@ class RetailEdgeProduct extends Model
 
     public function children(): HasMany
     {
-        return $this->hasMany(RetailEdgeProduct::class, 'old_key', 'sku');
+        // Exclude self-reference: a parent whose old_key equals its own sku
+        // satisfies the foreign-key match and would otherwise appear as its
+        // own child, breaking the parent/child guards in the sync commands.
+        return $this->hasMany(RetailEdgeProduct::class, 'old_key', 'sku')
+            ->whereColumn('old_key', '!=', 'sku');
     }
 
     public function parent(): BelongsTo
@@ -72,5 +76,4 @@ class RetailEdgeProduct extends Model
     {
         return $this->belongsTo(Brand::class, 'brand_id', 'brand_id');
     }
-
 }

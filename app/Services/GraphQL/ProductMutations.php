@@ -226,4 +226,27 @@ class ProductMutations
         }
         GRAPHQL;
     }
+
+    /**
+     * Bulk-delete variants from a product. Shopify rejects deletion of the
+     * last variant on a product — call deleteProduct() for that case
+     * instead.
+     */
+    public static function productVariantsBulkDelete(): string
+    {
+        return <<<'GRAPHQL'
+        mutation productVariantsBulkDelete($productId: ID!, $variantsIds: [ID!]!) {
+            productVariantsBulkDelete(productId: $productId, variantsIds: $variantsIds) {
+                product {
+                    id
+                    title
+                }
+                userErrors {
+                    field
+                    message
+                }
+            }
+        }
+        GRAPHQL;
+    }
 }

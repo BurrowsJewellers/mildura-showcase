@@ -36,9 +36,17 @@ Schedule::command(GetProductsFromEWeb::class)
         Artisan::call('shopify:create-product-graphql');
     });
 
+// Refresh local mirror, then dedupe parent-level then variant-level. Order
+// matters: delete-duplicate-products consolidates each parent SKU to one
+// Shopify product so the variant pass has a stable parent → product
+// mapping when it picks the "correct" host for child SKUs.
 Schedule::command(GetProductsGraphQL::class)
     ->cron('5 */4 * * *')
-    ->withoutOverlapping();
+    ->withoutOverlapping()
+    ->after(function () {
+        Artisan::call('shopify:delete-duplicate-products', ['--force' => true]);
+        Artisan::call('shopify:delete-duplicate-variants', ['--force' => true]);
+    });
 
 Schedule::command(ArchiveProductsGraphQL::class)
     ->hourly()

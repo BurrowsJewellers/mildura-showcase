@@ -40,10 +40,18 @@ class CreateProductGraphQL extends Command
 
             $this->graphqlService = new ShopifyGraphQLService;
 
-            $pendingQuery = fn () => RetailEdgeProduct::with(['brand'])
+            // Only consider parent/standalone rows. Child rows
+            // (old_key set and != sku) belong on their parent as variants
+            // and must never be created as standalone products.
+            $pendingQuery = fn () => RetailEdgeProduct::with(['brand', 'children'])
                 ->where('uploaded_to_shopify', 0)
                 ->where('quantity', '>', 0)
                 ->whereNotNull('sku')
+                ->where(function ($query) {
+                    $query->whereColumn('old_key', 'sku')
+                        ->orWhere('old_key', '')
+                        ->orWhereNull('old_key');
+                })
                 ->whereNotExists(function ($query) {
                     $query->select(DB::raw(1))
                         ->from('shopify_product_variants')
@@ -101,6 +109,45 @@ class CreateProductGraphQL extends Command
     {
         try {
             $this->info("Creating product: {$product->title} (SKU: {$product->sku})");
+
+            // Defensive: a child row that slipped past the parent-only
+            // filter must never be created as a standalone product. Mark
+            // uploaded so it's not picked up again.
+            if (! empty($product->old_key) && $product->old_key !== $product->sku) {
+                Log::warning('CreateProductGraphQL: skipping child product that slipped through filter', [
+                    'sku' => $product->sku,
+                    'old_key' => $product->old_key,
+                ]);
+                $product->update(['uploaded_to_shopify' => 1]);
+
+                return;
+            }
+
+            // If any child SKU is already on Shopify, the parent and its
+            // children are effectively already represented. Mark them
+            // uploaded and skip — recreating would just produce a
+            // duplicate parent product.
+            $childSkus = $product->children->pluck('sku')->filter()->all();
+            if (! empty($childSkus)) {
+                $existingChildSkus = ShopifyProductVariant::whereIn('sku', $childSkus)
+                    ->pluck('sku')
+                    ->all();
+
+                if (! empty($existingChildSkus)) {
+                    Log::info('CreateProductGraphQL: skipping parent — children already on Shopify', [
+                        'parent_sku' => $product->sku,
+                        'existing_child_skus' => $existingChildSkus,
+                    ]);
+                    $this->info("Skipping {$product->sku}: children already exist on Shopify");
+
+                    $product->update(['uploaded_to_shopify' => 1]);
+                    $product->children()
+                        ->whereIn('sku', $existingChildSkus)
+                        ->update(['uploaded_to_shopify' => 1]);
+
+                    return;
+                }
+            }
 
             if ($this->adoptExistingShopifyProductBySku($product)) {
                 return;
